@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14202b">
+<title>Fahima</title>
+<style>
+:root{--bg:#f3f6f8;--card:#fff;--ink:#14202b;--mute:#6b7a88;--acc:#0f8b8d;--me:#dff1f1;--line:#d9e1e7}
+@media (prefers-color-scheme:dark){:root{--bg:#14202b;--card:#1d2d3b;--ink:#eef3f6;--mute:#93a4b3;--acc:#3cc3c5;--me:#24505a;--line:#2c4050}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,sans-serif;display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+header{padding:14px 18px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line)}
+h1{font-size:20px;margin:0;font-family:Georgia,serif}
+#state{font-size:13px;color:var(--mute)}
+button.ghost{background:none;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:6px 10px}
+#log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.m{max-width:85%;padding:10px 13px;border-radius:14px;background:var(--card);border:1px solid var(--line);white-space:pre-wrap}
+.me{align-self:flex-end;background:var(--me)}
+footer{padding:12px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
+input{flex:1;min-width:0;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--ink);font:inherit}
+#mic{padding:0 16px;height:56px;border-radius:28px;border:0;background:var(--acc);color:#fff;font-size:16px;font-weight:600}
+#mic.on{background:#d64545}
+#send{padding:12px 14px;border-radius:12px;border:0;background:var(--ink);color:var(--bg)}
+#panel{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:20px;z-index:20}
+#panel.show{display:flex}
+#box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;width:100%;max-width:420px;display:flex;flex-direction:column;gap:10px}
+#box label{font-size:13px;color:var(--mute)}
+#box .row{display:flex;gap:8px}
+#box button{flex:1;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+#box button.pri{background:var(--acc);color:#fff;border:0}
+</style>
+</head>
+<body>
+<header><div><h1>Fahima</h1><div id="state">Off</div></div><button class="ghost" id="cfg">Settings</button></header>
+<div id="log"></div>
+<footer>
+<input id="txt" placeholder="Type a command…" autocomplete="off">
+<button id="send">Send</button>
+<button id="mic">🎤 Start</button>
+</footer>
+<div id="panel"><div id="box">
+<strong>Settings</strong>
+<label>AI model (type: local for offline, or a Gemini name)</label>
+<input id="fmodel">
+<div class="row"><button id="useLocal">Use offline (local)</button><button id="useOnline">Use online (Lite)</button></div>
+<label>Gemini API key (only for online mode)</label>
+<input id="fkey" type="password">
+<div class="row"><button id="closeP">Cancel</button><button class="pri" id="saveP">Save</button></div>
+</div></div>
+<script>
+const MODEL = "gemini-3.8-flash"; // change if Google renames it
+const SYSTEM = "You are Fahima, a smart, polite personal voice assistant. Always call the user 'Boss'. Always reply in English only. Reply in ONE or TWO very short sentences because replies are spoken aloud. Obey the Boss's commands.";
+const $ = id => document.getElementById(id);
+const log = $("log"), state = $("state"), micBtn = $("mic");
+let history = [], rec = null, active = false, listening = false, pending = 0, busy = false, wake = null;
+const store = {
+  get(k){ try{ return localStorage.getItem(k) }catch(e){ return null } },
+  set(k,v){ try{ localStorage.setItem(k,v) }catch(e){} }
+};
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+function add(text, me){
+  const d = document.createElement("div");
+  d.className = "m" + (me ? " me" : "");
+  d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight;
+  return d;
+}
+function setState(t){ state.textContent = t; }
+
+// ---------- speaking ----------
+function speakChunk(t){
+  t = t.trim(); if(!t || !("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(t);
+  u.lang = "en-US"; u.rate = 1.1;
+  const v = speechSynthesis.getVoices().find(v => /en/i.test(v.lang) && /female|woman/i.test(v.name));
+  if(v) u.voice = v;
+  pending++;
+  const done = () => { pending = Math.max(0, pending - 1); resume(); };
+  u.onend = done; u.onerror = done;
+  if(listening && rec) { try{ rec.abort(); }catch(e){} }
+  speechSynthesis.speak(u);
+  setState("Speaking…");
+}
+function say(text){ add(text, false); speakChunk(text); }
+
+// ---------- listening (always-on loop) ----------
+function resume(){
+  if(active && !listening && pending === 0 && !busy && !document.hidden) startRec();
+  else if(!active) setState("Off");
+}
+function startRec(){
+  if(!SR){ add("Boss, voice input needs Chrome.", false); stopAll(); return; }
+  rec = new SR(); rec.lang = "en-US"; rec.interimResults = false;
+  rec.onstart = () => { listening = true; setState("Listening…"); };
+  rec.onend = () => { listening = false; setTimeout(resume, 150); };
+  rec.onerror = e => {
+    if(e.error === "not-allowed" || e.error === "service-not-allowed"){ add("Boss, please allow the microphone.", false); stopAll(); }
+  };
+  rec.onresult = e => handle(e.results[0][0].transcript);
+  try{ rec.start(); }catch(e){}
+}
+async function lockScreen(){
+  try{ if("wakeLock" in navigator) wake = await navigator.wakeLock.request("screen"); }catch(e){}
+}
+function startAll(){
+  active = true; micBtn.classList.add("on"); micBtn.textContent = "⏹ Stop";
+  lockScreen(); speakChunk("I am listening, Boss."); if(!("speechSynthesis" in window)) resume();
+}
+function stopAll(){
+  active = false; micBtn.classList.remove("on"); micBtn.textContent = "🎤 Start";
+  if(rec){ try{ rec.abort(); }catch(e){} }
+  speechSynthesis.cancel(); pending = 0; listening = false;
+  try{ if(wake){ wake.release(); wake = null; } }catch(e){}
+  setState("Off");
+}
+micBtn.onclick = () => active ? stopAll() : startAll();
+document.addEventListener("visibilitychange", () => { if(!document.hidden){ if(active) lockScreen(); resume(); } });
+
+// ---------- local instant commands ----------
+function local(c){
+  const s = c.toLowerCase().replace(/^(hey |hi |ok )?fahima[, ]*/,"").trim();
+  let m;
+  if(/^(stop|go to sleep|sleep|turn off|goodbye|bye)\b/.test(s)){ add("Goodbye, Boss.", false); stopAll(); return true; }
+  if(s.includes("what time")) return say("Boss, it is " + new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})), true;
+  if(s.includes("what") && s.includes("date")) return say("Boss, today is " + new Date().toLocaleDateString([], {weekday:"long",day:"numeric",month:"long"})), true;
+  if((m = s.match(/^(?:call|dial) ([\d\s+]+)$/))){ say("Calling now, Boss."); setTimeout(()=>{location.href = "tel:" + m[1].replace(/\s/g,"")},900); return true; }
+  if(s === "open youtube"){ say("Opening YouTube, Boss."); setTimeout(()=>window.open("https://m.youtube.com","_blank"),900); return true; }
+  if((m = s.match(/^(?:play|youtube) (.+)/))){ say("Playing on YouTube, Boss."); setTimeout(()=>window.open("https://www.youtube.com/results?search_query=" + encodeURIComponent(m[1]),"_blank"),900); return true; }
+  if((m = s.match(/^(?:search|google)(?: for)? (.+)/))){ say("Searching, Boss."); setTimeout(()=>window.open("https://www.google.com/search?q=" + encodeURIComponent(m[1]),"_blank"),900); return true; }
+  if((m = s.match(/^(?:navigate to|directions to|map of) (.+)/))){ say("Opening maps, Boss."); setTimeout(()=>window.open("https://www.google.com/maps/search/" + encodeURIComponent(m[1]),"_blank"),900); return true; }
+  if(s.includes("open whatsapp")){ say("Opening WhatsApp, Boss."); setTimeout(()=>window.open("https://wa.me/","_blank"),900); return true; }
+  if(s.includes("open facebook")){ say("Opening Facebook, Boss."); setTimeout(()=>window.open("https://m.facebook.com","_blank"),900); return true; }
+  return false;
+}
+
+// ---------- fast streaming AI ----------
+async function ai(text){
+  const model = store.get("fm") || MODEL;
+  const isLocal = model.toLowerCase() === "local";
+  const key = store.get("fk");
+  if(!isLocal && !key){ say("Boss, please add your API key in Settings first."); return; }
+  history.push({role:"user", parts:[{text}]});
+  busy = true; setState("Thinking…");
+  const bubble = add("…", false);
+  let full = "", buf = "";
+  const onText = t => {
+    if(!t) return;
+    full += t; buf += t; bubble.textContent = full;
+    let mm;
+    while((mm = buf.match(/^([\s\S]*?[.!?])\s+([\s\S]*)$/))){ speakChunk(mm[1]); buf = mm[2]; }
+    log.scrollTop = log.scrollHeight;
+  };
+  try{
+    let r, tries = 0;
+    while(true){
+      if(isLocal){
+        const msgs = [{role:"system", content:SYSTEM}].concat(history.slice(-8).map(h => ({role: h.role === "model" ? "assistant" : "user", content: h.parts[0].text})));
+        r = await fetch("http://127.0.0.1:8080/v1/chat/completions", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ messages: msgs, stream: true, max_tokens: 120, temperature: 0.7 })
+        });
+      } else {
+        r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + encodeURIComponent(key), {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ systemInstruction:{parts:[{text:SYSTEM}]}, contents: history.slice(-12) })
+        });
+      }
+      if(r.ok) break;
+      if((r.status === 503 || r.status === 429) && tries < 3){ tries++; setState("Busy, retrying…"); await new Promise(z => setTimeout(z, 1200*tries)); continue; }
+      const j = await r.json().catch(()=>({})); throw new Error(j.error && j.error.message || "Request failed");
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let sse = "";
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      sse += dec.decode(value, {stream:true});
+      const lines = sse.split("\n"); sse = lines.pop();
+      for(const ln of lines){
+        if(!ln.startsWith("data:") || ln.includes("[DONE]")) continue;
+        try{
+          const j = JSON.parse(ln.slice(5));
+          if(isLocal) onText(j.choices && j.choices[0].delta && j.choices[0].delta.content || "");
+          else onText((j.candidates && j.candidates[0].content.parts || []).map(p => p.text || "").join(""));
+        }catch(e){}
+      }
+    }
+    if(buf.trim()) speakChunk(buf);
+    history.push({role:"model", parts:[{text:full}]});
+  }catch(e){
+    const msg = isLocal ? "I cannot reach my offline brain. Please start the server in Termux." : "Sorry Boss, something went wrong.";
+    bubble.textContent = msg + " (" + e.message + ")";
+    speakChunk(msg);
+  }
+  busy = false; resume();
+}
+
+function handle(text){
+  text = text.trim(); if(!text) return;
+  add(text, true);
+  if(!local(text)) ai(text);
+}
+
+$("send").onclick = () => { handle($("txt").value); $("txt").value = ""; };
+$("txt").onkeydown = e => { if(e.key === "Enter") $("send").click(); };
+$("cfg").onclick = () => {
+  $("fmodel").value = store.get("fm") || MODEL;
+  $("fkey").value = store.get("fk") || "";
+  $("panel").classList.add("show");
+};
+$("useLocal").onclick = () => { $("fmodel").value = "local"; };
+$("useOnline").onclick = () => { $("fmodel").value = "gemini-3.1-flash-lite"; };
+$("closeP").onclick = () => $("panel").classList.remove("show");
+$("saveP").onclick = () => {
+  store.set("fm", $("fmodel").value.trim() || MODEL);
+  store.set("fk", $("fkey").value.trim());
+  $("panel").classList.remove("show");
+  history = [];
+  add("Settings saved, Boss. Mode: " + (store.get("fm")), false);
+};
+
+add("Hello Boss, I am Fahima. Tap Start and I will keep listening until you tap Stop.", false);
+if(!store.get("fk")) add("Tap Settings and paste your free Gemini API key first.", false);
+</script>
+</body>
+</html>
